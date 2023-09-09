@@ -10,6 +10,7 @@
 #include <vector>
 #include <net/if.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 
 #include "tcp_interface/msg/tcp_socket.hpp"
 #include "tcp_interface/srv/tcp_socket_i_ctrl.hpp"
@@ -41,6 +42,8 @@ namespace tcp_interface {
         void server_thread(int port, pthread_t parent_pthread_t);
         std::recursive_mutex thread_map_mtx_;
         void detach_thread(int port);
+
+        int newconnection_eventfd;
 
         std::recursive_mutex current_state_mtx_;
         rclcpp_lifecycle::State _get_current_state();

@@ -14,6 +14,8 @@
 #include <cstring>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <sys/eventfd.h>
+#include <sys/epoll.h>
 
 #include "std_msgs/msg/string.hpp"
 #include "ros2_tcp_interface/tcp_node.hpp"
@@ -115,11 +117,13 @@ namespace tcp_interface {
 
             if ((org_sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
                 RCLCPP_ERROR(this->get_logger(), "TCP Socket Creation Error");
+                return;
             }
 
             int enable = 1;
             if (setsockopt(org_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
                 RCLCPP_ERROR(this->get_logger(), "TCP Socket setsockopt Error");
+                return;
             }
 
             memset(&addr, 0, sizeof(struct sockaddr_in));
@@ -129,13 +133,15 @@ namespace tcp_interface {
 
             if (bind(org_sockfd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
                 RCLCPP_ERROR(this->get_logger(), "TCP Socket Bind Error when binding port:%d", port);
+                return;
             }
 
             if (listen(org_sockfd, SOMAXCONN) < 0) {
                 RCLCPP_ERROR(this->get_logger(), "TCP Socket Listen Error");
             }
 
-            pthread_kill(parent_pthread_t, SIGUSR1);    // tells handleservice_ that socket is made
+            uint64_t counter = 1;
+            write(newconnection_eventfd, &counter, sizeof(counter));    // tells handleservice_ that socket is made
             RCLCPP_INFO(this->get_logger(), "TCP Socket Binded to Port:%d", port);
 
             if ((client_sockfd = accept(org_sockfd, (struct sockaddr *) &from_addr, &len)) < 0) {
@@ -187,15 +193,9 @@ namespace tcp_interface {
 
     void TcpInterface::handleService_(const std::shared_ptr<tcp_interface::srv::TcpSocketICtrl::Request> &request,
                                       const std::shared_ptr<tcp_interface::srv::TcpSocketICtrl::Response> &response) {
-        sigset_t ss;
-        sigemptyset(&ss); // initialize signal
-        if (sigaddset(&ss, SIGUSR1) != 0) {    // Set SIGUSR1 to catch port registration ack.
-            RCLCPP_ERROR(this->get_logger(), "err sigaddset");
-            response->ack = false;
-            return;
-        }
-        if (sigprocmask(SIG_BLOCK, &ss, nullptr) != 0) {   // mask SIGUSR1
-            RCLCPP_ERROR(this->get_logger(), "err sigprocmask");
+        newconnection_eventfd = eventfd(0, EFD_CLOEXEC);
+        if (newconnection_eventfd == -1){
+            RCLCPP_ERROR(this->get_logger(), "EFD CREATION ERROR");
             response->ack = false;
             return;
         }
@@ -213,24 +213,38 @@ namespace tcp_interface {
         tcp_port_threads[opening_port] = std::make_unique<std::thread>(&TcpInterface::server_thread, this, opening_port,
                                                                        parent_pthread_t);   // bundle port to thread object
         thread_map_mtx_.unlock();
-        // wait for 1000ms
-        struct timespec ts{};
-        ts.tv_sec = 0;
-        ts.tv_nsec = 1000 * 1000 * 1000;
-
-        siginfo_t siginfo;
-        int sig = sigtimedwait(&ss, &siginfo, &ts);
-        if (sig == SIGUSR1) {
-            response->ack = true;
-            return;
-        } else if (sig == -1 && errno == EAGAIN) {
-            RCLCPP_ERROR(this->get_logger(), "SIGWAIT TIMEOUT");
+        // wait for 100ms before timeout.
+        int epfd = epoll_create1(0);
+        if (epfd == -1) {
+            close(newconnection_eventfd);
+            RCLCPP_ERROR(this->get_logger(), "EPOLL_CREATE ERROR");
+            RCLCPP_ERROR(this->get_logger(), "error:%s", strerror(errno));
             response->ack = false;
+            close(epfd);
             return;
+        }
+
+        struct epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = newconnection_eventfd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, newconnection_eventfd, &ev);
+
+        int timeout_ms = 500;
+        int nfds = epoll_wait(epfd, &ev, 1, timeout_ms);
+        if (nfds == -1) {
+            RCLCPP_ERROR(this->get_logger(), "EPOLL ERROR");
+            RCLCPP_ERROR(this->get_logger(), "error:%s", strerror(errno));
+            response->ack = false;
+        } else if (nfds == 0) {
+            RCLCPP_ERROR(this->get_logger(), "SIGWAIT TIMEOUT");
+            RCLCPP_ERROR(this->get_logger(), "error:%s", strerror(errno));
+            response->ack = false;
         } else {
-            RCLCPP_ERROR(this->get_logger(), "Unexpected error:%s", strerror(errno));
+            uint64_t counter;
+            read(newconnection_eventfd, &counter, sizeof(counter));
             response->ack = true;
         }
+        close(epfd);
     }
 
     void TcpInterface::detach_thread(int port) {
