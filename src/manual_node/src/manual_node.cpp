@@ -38,9 +38,6 @@ namespace manual_node {
             RCLCPP_INFO(this->get_logger(), "waiting for TCP service");
         }
 
-//        rclcpp::WallRate loop_rate(500ms);
-//        loop_rate.sleep();
-
         auto request_tcp_8011 = std::make_shared<tcp_interface::srv::TcpSocketICtrl::Request>();
         request_tcp_8011->port = 8011;
         auto future_response_tcp_8011 = client_->async_send_request(request_tcp_8011, std::bind(&ManualNode::_callback_response_tcp8011,
